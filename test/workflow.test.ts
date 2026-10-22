@@ -202,6 +202,11 @@ test('wakeFrom bypasses unavailable Jev, coalesces threads and retains dedup acr
   };
   const config = triageConfig(h.config, { policy: { ...defaultPolicy, labels: [{ name: 'Work', description: 'Work mail' }] } });
   workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+  async function pollSettled() {
+    await waitFor(() => !workflow.status().polling);
+    await workflow.poll();
+    await waitFor(() => !workflow.status().polling && !workflow.status().working && !workflow.status().triage!.labeling);
+  }
   try {
     await workflow.start();
     workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['NO-REPLY@other.test', 'OUTSIDE.TEST', 'outside.test'] });
@@ -210,14 +215,14 @@ test('wakeFrom bypasses unavailable Jev, coalesces threads and retains dedup acr
     const first = message('aa01', 'First', { sender: 'no-reply@other.test' });
     const second = message('aa02', 'Second', { sender: 'no-reply@other.test' });
     h.setFixture(fixture([first, second]));
-    await workflow.poll(); await waitFor(() => !workflow.status().working && !workflow.status().triage!.labeling);
+    await pollSettled();
     assert.deepEqual(covered, [['aa01', 'aa02']]);
     assert.equal(provider.calls(), 0, 'the deprecated sender shorthand uses deterministic label classification');
     assert.ok([first, second].every(item => workflow.inspect(item.id)[0].labels?.status === 'done'));
     assert.ok(h.calls().some(args => args.includes('modify')), 'shorthand rules apply their labels through the shared worker');
     await workflow.stop();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
-    await workflow.start(); await workflow.poll();
+    await workflow.start(); await pollSettled();
     assert.equal(covered.length, 1);
     t.mock.timers.setTime(activated + 60000);
     workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', {
@@ -225,7 +230,7 @@ test('wakeFrom bypasses unavailable Jev, coalesces threads and retains dedup acr
     });
     const later = message('aa03', 'Earlier domain rule still covers this mail', { sender: 'another@outside.test', received: activated + 30000 });
     h.setFixture(fixture([first, second, later]));
-    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    await pollSettled();
     assert.deepEqual(covered, [['aa01', 'aa02'], ['aa03']]);
     assert.equal(provider.calls(), 0);
     workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['no-reply@other.test'] });
@@ -234,14 +239,14 @@ test('wakeFrom bypasses unavailable Jev, coalesces threads and retains dedup acr
     const disabledPeriod = { ...message('aa04', 'While domain was disabled', { sender: 'fresh@outside.test', received: activated + 90000 }), threadId: 'bb04' };
     const fresh = { ...message('aa05', 'After domain reactivation', { sender: 'fresh@outside.test' }), threadId: 'bb05' };
     h.setFixture(separateThreads([disabledPeriod, fresh]));
-    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    await pollSettled();
     assert.equal(workflow.inspect(disabledPeriod.id)[0].message.status, 'queue', 'preactivation mail still receives ordinary classification');
     assert.deepEqual(covered, [['aa01', 'aa02'], ['aa03'], ['aa05']]);
     assert.equal(provider.calls(), 1, 'only the preactivation message needs semantic classification');
     const nonmatches = ['person@sub.outside.test', 'person@outside.test.attacker.test', 'another@other.test']
       .map((sender, i) => ({ ...message(`aa1${i}`, 'Not allowlisted', { sender }), threadId: `bb1${i}` }));
     h.setFixture(separateThreads(nonmatches));
-    await workflow.poll(); await waitFor(() => !workflow.status().working && !workflow.status().triage!.labeling);
+    await pollSettled();
     assert.equal(covered.length, 3, 'domains are exact; individual addresses do not approve their whole domain');
     for (const item of nonmatches) assert.equal(workflow.inspect(item.id)[0].message.status, 'queue');
     assert.ok(provider.calls() >= nonmatches.length, 'nonmatches still reach Jev');
