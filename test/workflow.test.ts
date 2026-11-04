@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { fork } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -611,20 +613,14 @@ test('reconciliation finds mail moved into Inbox across the rolling window and p
   for (const testCase of cases) await t.test(JSON.stringify(testCase), async sub => withHarness(async h => {
     const { maxAgeDays, fileLookback, liveLookbacks } = testCase;
     sub.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-    const received = Date.now() - (maxAgeDays === 30 ? 20 : 40) * 86400000;
+    const received = Date.now() - (maxAgeDays === 30 ? 20 : maxAgeDays === 60 ? 40 : 400) * 86400000;
     const target = message('aa01', 'Moved back to Inbox', { received });
     target.labelIds = [];
     h.setFixture(fixture([target]));
     const config = triageConfig({ ...h.config, settings: { maxAgeDays,
       ...(fileLookback === undefined ? {} : { reconcileLookbackSeconds: fileLookback }) } });
     const provider = assessments();
-    const mail = new GogMailClient(config), search = mail.searchPage.bind(mail);
-    // The fake CLI checks Inbox membership; this adds Gmail's timestamp filter.
-    mail.searchPage = async (after, ...rest) => {
-      const result = await search(after, ...rest);
-      return { ...result, messages: received / 1000 > after ? result.messages : [] };
-    };
-    let workflow = createMailWorkflow({ config, stateDir: h.stateDir, mail, ...provider,
+    let workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider,
       subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
     try {
       await workflow.start();
@@ -638,14 +634,24 @@ test('reconciliation finds mail moved into Inbox across the rolling window and p
       legacy.prepare("UPDATE policies SET settings=json_set(settings,'$.reconcileLookbackSeconds',604800) WHERE json_extract(settings,'$.reconcileLookbackSeconds') IS NULL").run();
       legacy.close();
       target.labelIds = ['INBOX']; h.setFixture(fixture([target]));
-      sub.mock.timers.setTime(Date.now() + 3600000);
-      workflow = createMailWorkflow({ config, stateDir: h.stateDir, mail, ...provider,
+      sub.mock.timers.setTime(Date.now() + 1000);
+      workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider,
         subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
-      await workflow.start(); await waitFor(() => !workflow.status().triage!.labeling);
+      await workflow.start();
+      assert.equal(workflow.inspect().length, 0, 'incremental polling stays narrow after restart');
+      assert.equal(provider.calls(), 0);
+      sub.mock.timers.setTime(Date.now() + 3599000);
+      await workflow.poll(); await waitFor(() => !workflow.status().triage!.labeling);
       const explicitLookback = fileLookback ?? liveLookbacks?.at(-1);
       assert.equal(workflow.policyGet().configuredSettings.reconcileLookbackSeconds, explicitLookback ?? null);
       assert.equal(workflow.inspect('aa01')[0]?.message.status, explicitLookback === undefined ? 'queue' : undefined);
       assert.equal(provider.calls(), explicitLookback === undefined ? 1 : 0, 'only mail inside the selected discovery window is classified');
+      await workflow.stop();
+      sub.mock.timers.setTime(Date.now() + 3600000);
+      workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider,
+        subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
+      await workflow.start(); await waitFor(() => !workflow.status().triage!.labeling);
+      assert.equal(provider.calls(), explicitLookback === undefined ? 1 : 0, 'later reconciliation and restart deduplicate tracked mail');
     } finally { await workflow.stop(); }
   }));
 });
@@ -1107,11 +1113,6 @@ test('triage replies honor the live toggle, send per conversation and defer only
     assert.deepEqual(workflow.status().messages, { deferred: 1, done: 2 });
     assert.equal(provider.calls(), 3, 'reply toggle does not reclassify mail');
     await workflow.stop();
-    // State left by older versions crashing after defer acknowledgment but
-    // before their run finalizer. Already-replied conversations stay done.
-    const legacy = h.db();
-    legacy.prepare("UPDATE messages SET status='processing' WHERE status='deferred'").run();
-    legacy.close();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
     await workflow.start();
     assert.deepEqual(workflow.status().messages, { deferred: 1, done: 2 });
@@ -1624,7 +1625,8 @@ test('only authorized human mail dispatches; unreadable threads retry after rest
     h.setFixture(f);
     await workflow.poll(); await waitFor(() => !workflow.status().working);
     assert.deepEqual(deliveries, [healthy.id]);
-    assert.deepEqual(workflow.status().messages, { done: 1, ignored: rejected.length, pending: 1 });
+    assert.deepEqual(workflow.status().messages, { done: 1, ignored: rejected.length - 1, pending: 1 });
+    assert.deepEqual(workflow.inspect('aa0a'), [], 'responder discovery excludes pre-activation mail');
     assert.equal(workflow.inspect(unreadable.id)[0].message.status, 'pending');
     await workflow.stop();
     f.threads[unreadable.threadId] = missing;
@@ -1632,12 +1634,83 @@ test('only authorized human mail dispatches; unreadable threads retry after rest
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, subagent });
     await workflow.start(); await waitFor(() => !workflow.status().working);
     assert.deepEqual(deliveries, [healthy.id, unreadable.id]);
-    assert.deepEqual(workflow.status().messages, { done: 2, ignored: rejected.length });
+    assert.deepEqual(workflow.status().messages, { done: 2, ignored: rejected.length - 1 });
     assert.deepEqual(workflow.status().jobs, { skipped: 2 });
   } finally { await workflow.stop(); }
 }));
 
-test('deferred responder waits for its active run, resumes once when due and repairs old acknowledgments', async t => withHarness(async h => {
+test('acknowledged deferral survives SIGKILL before finalization and repairs legacy children', async t => {
+  for (const triage of [false, true]) for (const legacy of [false, true])
+    await t.test(`${triage ? 'triage with a sent reply' : 'responder'}; legacy=${legacy}`, async sub => withHarness(async h => {
+      const now = Date.now();
+      sub.mock.timers.enable({ apis: ['Date'], now });
+      h.setFixture(fixture([]));
+      const config = triage ? triageConfig(h.config) : h.config;
+      const child = fork(new URL('./fixtures/crash-after-defer.ts', import.meta.url),
+        [h.stateDir, JSON.stringify(config), String(now)], { execArgv: ['--import', 'tsx'], silent: true });
+      const exited = once(child, 'exit');
+      const events: Array<{ event: string; job?: string; due?: number }> = [];
+      let errors = '';
+      child.stderr!.on('data', chunk => { errors += String(chunk); });
+      child.on('message', event => { events.push(event as typeof events[number]); });
+      let workflow: ReturnType<typeof createMailWorkflow> | undefined;
+      try {
+        await waitFor(() => events.some(event => event.event === 'ready') || child.exitCode !== null, 10000);
+        assert.ok(events.some(event => event.event === 'ready'), errors);
+        const messages = ['aa01', 'aa02'].map((id, i) => ({ ...message(id, 'Please follow up', { received: now + 1000 }),
+          threadId: triage ? `bb0${i + 1}` : 'bb01' }));
+        h.setFixture(triage ? separateThreads(messages) : fixture(messages));
+        child.send('poll');
+        await waitFor(() => child.signalCode !== null || child.exitCode !== null, 10000);
+        assert.deepEqual(await exited, [null, 'SIGKILL'], errors);
+        const acknowledgment = events.find(event => event.event === 'acknowledged');
+        assert.ok(acknowledgment?.job && acknowledgment.due, errors);
+        const due = acknowledgment.due;
+        const db = h.db();
+        try {
+          const job = db.prepare('SELECT status,finished FROM jobs WHERE id=?').get(acknowledgment.job);
+          assert.equal(job?.status, 'deferred');
+          assert.equal(job.finished, null, 'the run finalizer never executed');
+          const statuses = db.prepare('SELECT id,status,due FROM messages ORDER BY id').all();
+          assert.deepEqual(statuses.map(row => [row.id, row.status, row.due]),
+            triage ? [['aa01', 'done', 0], ['aa02', 'deferred', due]] : [['aa01', 'deferred', due], ['aa02', 'deferred', due]]);
+          // Exact legacy crash state: only unfinished children were left
+          // processing; the acknowledged parent, due times and receipts survived.
+          if (legacy) db.prepare("UPDATE messages SET status='processing' WHERE status='deferred'").run();
+        } finally { db.close(); }
+        const wakes: string[][] = [];
+        const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+        workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent: {
+          async run({ sessionKey, message: prompt }) {
+            const jobId = jobIdFromPrompt(prompt);
+            wakes.push(workflow!.context(jobId, sessionKey).messages.flatMap(row => row.messageIds));
+            workflow!.complete({ jobId, sessionKey, reason: 'Finished after restart' });
+            return { runId: jobId };
+          },
+          async waitForRun() { return { status: 'ok' }; },
+        } });
+        sub.mock.timers.setTime((due - 1) * 1000);
+        await workflow.start();
+        assert.equal(workflow.status().nextDeferredWakeAt, due);
+        assert.deepEqual(wakes, [], 'restart does not resume before the acknowledged deadline');
+        if (triage) assert.equal(workflow.inspect('aa01')[0].message.status, 'done');
+        sub.mock.timers.setTime(due * 1000);
+        await workflow.poll(); await waitFor(() => !workflow!.status().working);
+        assert.deepEqual(wakes, [triage ? ['aa02'] : ['aa01', 'aa02']]);
+        assert.deepEqual(workflow.status().messages, { done: 2 });
+        assert.deepEqual(workflow.status().unresolvedJobs, []);
+        await workflow.poll();
+        assert.equal(wakes.length, 1, 'recovered work dispatches once');
+        assert.equal(h.calls().filter(args => args.includes('send')).length, triage ? 1 : 0, 'sent work is never replayed');
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        await exited;
+        await workflow?.stop();
+      }
+    }));
+});
+
+test('deferred responder waits for its active run and resumes once when due across restart', async t => withHarness(async h => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   h.setFixture(fixture([]));
   const config = h.config;
@@ -1672,12 +1745,9 @@ test('deferred responder waits for its active run, resumes once when due and rep
     release(); await waitFor(() => !workflow.status().working);
     assert.equal(runs, 2, 'the predecessor finalizer must not overwrite the due retry');
     await workflow.stop();
-    const legacy = h.db();
-    legacy.prepare("UPDATE messages SET status='processing' WHERE status='deferred'").run();
-    legacy.close();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, subagent });
     await workflow.start();
-    assert.equal(workflow.status().messages.deferred, 1, 'restart repairs legacy acknowledged deferrals');
+    assert.equal(workflow.status().messages.deferred, 1, 'restart retains acknowledged deferrals');
     t.mock.timers.setTime(Date.now() + 3599000);
     await workflow.poll(); await waitFor(() => !workflow.status().working);
     assert.equal(runs, 2, 'restart must retain the second deferral deadline');
@@ -2335,7 +2405,7 @@ test('a waiting wake survives policy replacement and a later downgrade to the da
   } finally { release(); await workflow.stop(); }
 }));
 
-test('rolling triage skips old messages before inference, handles new replies once, and expires a waiting queue', async (t) => withHarness(async (h) => {
+test('rolling triage excludes old messages before inference, handles new replies once, and expires a waiting queue', async (t) => withHarness(async (h) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const day = 86400000;
   const old = message('aa01', 'Old mail must not call Jev', { received: Date.now() - 40 * day });
@@ -2362,8 +2432,7 @@ test('rolling triage skips old messages before inference, handles new replies on
   try {
     await workflow.start();
     assert.equal(provider.calls(), 1, 'old mail never reaches the decision provider');
-    assert.equal(workflow.inspect(old.id)[0].message?.reason, 'older than maxAgeDays');
-    assert.equal(workflow.status().messages.skipped, 1);
+    assert.deepEqual(workflow.inspect(old.id), [], 'discovery excludes mail outside the configured age window');
     t.mock.timers.setTime(Date.now() + 60000);
     const reply = message('aa03', 'New external reply in the old thread', { sender: 'outside@elsewhere.test' });
     const other = message('aa04', 'Another new conversation', { sender: 'outside@elsewhere.test' });

@@ -36,6 +36,17 @@ if (fixture.probeWritableDb) {
 let result;
 if (command[1] === 'messages' && command[2] === 'search') {
   result = command.includes('--page') ? fixture.pages?.[command[command.indexOf('--page') + 1]] : fixture.search;
+  const after = /(?:^|\s)after:(\d+)(?:\s|$)/.exec(command[3]);
+  const before = /(?:^|\s)before:(\d+)(?:\s|$)/.exec(command[3]);
+  if (result && (after || before)) {
+    result = { ...result, messages: result.messages.filter(({ id, threadId }) => {
+      const target = fixture.threads?.[threadId]?.thread.messages.find(message => message.id === id);
+      // Missing threads still exercise read failures after discovery.
+      if (!target) return true;
+      const received = Number(target.internalDate) / 1000;
+      return (!after || received > Number(after[1])) && (!before || received < Number(before[1]));
+    }) };
+  }
   if (result && command[3].split(/\s+/).includes('in:inbox')) {
     result = { ...result, messages: result.messages.filter(({ id, threadId }) =>
       fixture.threads?.[threadId]?.thread.messages.some(message => message.id === id && message.labelIds.includes('INBOX'))) };

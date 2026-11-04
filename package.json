@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/gog-email-watch",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "license": "MIT",
   "description": "Label-first Gmail triage, configurable mailbox routing and approved-sender agent workflows through gog.",
   "type": "module",
