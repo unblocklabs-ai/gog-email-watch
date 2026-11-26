@@ -1,7 +1,9 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { createDecisionClient, DecisionError, type DecisionClient, type QuestionMap } from "@unblocklabs/decisions";
 import type { DecisionBatch, DecisionOutcome, DecisionRuntimeV1 } from "openclaw/plugin-sdk/decisions";
 import { evidence, fitEvidence } from "./evidence.js";
 import { mailCutoff, threadFacts, type GmailMessage, type GmailThread, type MailConfig } from "./mail.js";
-import { hash, type Action, type PolicyStore, type RuntimeLabel } from "./policy.js";
+import { hash, triageModelId, type Action, type PolicyStore, type RuntimeLabel } from "./policy.js";
 import type { MailState } from "./state.js";
 
 export interface TriageRecord {
@@ -9,7 +11,7 @@ export interface TriageRecord {
   policy_version: number; facts: string; plan: string; coverage: string; historical: number; updated: number;
 }
 type EffectTarget = Pick<TriageRecord, "id" | "thread_id" | "evidence_hash" | "assessment_key" | "policy_version">;
-type Assessment = { rows: TriageRecord[]; action: Action | "keep"; labels: string[]; source: "rules" | "jev" };
+type Assessment = { rows: TriageRecord[]; action: Action | "keep"; labels: string[]; source: "rules" | "jev" | "decision_model" };
 export interface TriageMail {
   getThread(id: string): Promise<GmailThread>;
   labelId(name: string): Promise<string>;
@@ -33,6 +35,9 @@ export function createTriage(options: {
   const { config, state, mail, signal, policies } = options;
   const settings = config.triage;
   const policy = policies.get;
+  const directClient: DecisionClient | undefined = settings && typeof settings.decisionModel !== "string"
+    ? createDecisionClient(settings.decisionModel)
+    : undefined;
   function assertCurrent(version: number) {
     const relevant = (snapshot: ReturnType<typeof policy>) =>
       [snapshot.document.prompt, snapshot.document.deletePrompt, snapshot.labels];
@@ -48,7 +53,35 @@ export function createTriage(options: {
       if (value.status === "ok") return value.result.answers;
     }
     signal.throwIfAborted();
-    if (!settings || !options.decisions || options.decisionModel?.() !== settings.decisionModel) throw new Error("decision provider is not configured for the requested model");
+    if (!settings) throw new Error("decision provider is not configured for the requested model");
+    if (directClient && typeof settings.decisionModel !== "string") {
+      const started = Date.now();
+      const timeoutMs = settings.decisionModel.timeoutMs ?? Math.min(60_000, Math.max(1, Math.ceil(policies.settings().decisionTimeoutSeconds * 1000)));
+      let result;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          result = await directClient.decide(batch.state, batch.questions as QuestionMap, { timeoutMs, signal });
+          break;
+        } catch (error) {
+          if (!(error instanceof DecisionError && error.retryAfter) || attempt >= 2) throw error;
+          await delay(1000, undefined, { signal });
+        }
+      }
+      signal.throwIfAborted();
+      state.setMeta("last_assessment_ms", Date.now() - started);
+      for (const [id, question] of Object.entries(batch.questions)) {
+        const answer = result.answers[id];
+        if (question.type !== "choice" || answer?.type !== "choice" || !(answer.choice in question.criteria)) throw new Error("invalid decision response");
+      }
+      const outcome = {
+        status: "ok" as const,
+        provenance: { providerId: directClient.config.endpoint, rubricVersion: "mail-label-first-v1" },
+        result: { model: result.model, answers: result.answers },
+      };
+      state.db.prepare("INSERT OR REPLACE INTO assessments VALUES (?,?,?)").run(key, JSON.stringify(outcome), now());
+      return outcome.result.answers;
+    }
+    if (!options.decisions || options.decisionModel?.() !== settings.decisionModel) throw new Error("decision provider is not configured for the requested model");
     const started = Date.now();
     const outcome = await options.decisions.evaluate(batch, {
         agentId: config.agentId, purpose, rubricVersion: "mail-label-first-v1", timeoutMs: Math.ceil(policies.settings().decisionTimeoutSeconds * 1000), signal,
@@ -110,7 +143,8 @@ export function createTriage(options: {
       criteria: { apply: "Conversation matches the explicit deletion policy", skip: "Conversation does not match the deletion policy" },
     };
     const limits = policies.settings();
-    const key = hash({ source: source.hash, account: config.account, facts, model: settings?.decisionModel, questions, matching: matching.map(label => label.name),
+    const key = hash({ source: source.hash, account: config.account, facts, model: triageModelId(settings) ?? undefined,
+      ...(directClient ? { transport: "direct" } : {}), questions, matching: matching.map(label => label.name),
       limits: [limits.maxInputTokens, limits.maxRequestTokens], rubric: "label-first-v1" });
     const fitted = Object.keys(questions).length
       ? fitEvidence(source, { account: config.account, threadId: thread.id, facts }, questions, limits)
@@ -126,7 +160,7 @@ export function createTriage(options: {
     if (!historical && targets.some(target => state.db.prepare("SELECT assessment_key FROM triage WHERE id=?").get(target.id)?.assessment_key !== admitted.get(target.id)))
       throw new Error("classification superseded by newer mail routing; retry");
     const action: Action | "keep" = historical ? deletion ? "delete" : "keep" : route(labels, deletion);
-    const classificationSource = deterministic || !Object.keys(questions).length ? "rules" : "jev";
+    const classificationSource = deterministic || !Object.keys(questions).length ? "rules" : directClient ? "decision_model" : "jev";
     // A code rule can cover authenticated participants in the conversation,
     // but a valid sender never lends its admission to forged or self mail.
     // Those messages remain evidence for this assessment, not owned targets.

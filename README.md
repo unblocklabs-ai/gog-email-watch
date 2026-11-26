@@ -306,7 +306,7 @@ start and continues with new arrivals.** The example disables deletion. A nonemp
 
 | Option | Type / default | Purpose |
 | --- | --- | --- |
-| `triage.decisionModel` | `"provider/model"` string; **required when triage is present** | Must match the target agent's resolved host decision model. |
+| `triage.decisionModel` | Object `{endpoint?, model?, apiKey?, apiKeyFile?, timeoutMs?}` **or** legacy `"provider/model"` string; **required when triage is present** | Object form calls the Decisions API directly via `@unblocklabs/decisions` (defaults: `https://codex.unblocklabs.ai/v1/decisions`, `liquid/d1.2-ultra`; credentials resolve from `apiKey`, `apiKeyFile`, or `CODEX_LB_API_KEY` on Codex LB) without requiring a host `decisionModel`. String form routes through OpenClaw's host Decisions runtime and must match the target agent's resolved `decisionModel`. |
 | `triage.wakeOnExternalReplies` | Legacy Boolean; ignored | Rolling triage now classifies external replies through the same prompt as all other inbox mail. Retained for configuration compatibility. |
 | `triage.concurrency` | Integer >= 1; `50` | File fallback for workers. Prefer the live-editable `settings.concurrency`. |
 | `triage.policy` | Object; default policy below | Initial classification policy. If supplied, include all four fields below. |

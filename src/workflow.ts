@@ -7,7 +7,7 @@ import type { DecisionRuntimeV1 } from "openclaw/plugin-sdk/decisions";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { evidence } from "./evidence.js";
 import { createTriage, type TriageRecord } from "./triage.js";
-import { concurrently, createPolicyStore, hash, labelRuleKey as ruleKey, labelRuleParts as ruleParts, type RuntimeLabel } from "./policy.js";
+import { concurrently, createPolicyStore, hash, labelRuleKey as ruleKey, labelRuleParts as ruleParts, triageModelId, type RuntimeLabel } from "./policy.js";
 import {
   GogMailClient,
   eligibility,
@@ -1156,7 +1156,7 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_reply", "gog_email_con
       messages: state.counts("messages"),
       jobs: state.counts("jobs"),
       unresolvedJobs: state.db.prepare("SELECT id,thread_id,status,reason FROM jobs WHERE status IN ('needs_review','failed','interrupted')").all(),
-      triage: { policyVersion: triage.policy().version, model: config.triage?.decisionModel ?? null,
+      triage: { policyVersion: triage.policy().version, model: triageModelId(config.triage),
         labels: policies.get().labels,
         concurrency: policies.settings().concurrency, eligibleAfter: mailCutoff(policies.settings().maxAgeDays), backlogBefore: Number(state.meta("triage_before")),
         queueMinutes: triage.policy().document.queueMinutes, labeling, scanning,

@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.11",
+  "version": "0.4.0",
   "description": "Label-first Gmail triage, configurable mailbox routing and optional approved-sender responses.",
   "activation": {
     "onStartup": true
@@ -150,8 +150,56 @@
             ],
             "properties": {
               "decisionModel": {
-                "minLength": 1,
-                "type": "string"
+                "anyOf": [
+                  {
+                    "minLength": 1,
+                    "description": "OpenClaw Decisions runtime provider/model string (legacy, e.g. typesafe/jev-1.13.0).",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "not": {
+                      "required": [
+                        "apiKey",
+                        "apiKeyFile"
+                      ]
+                    },
+                    "type": "object",
+                    "properties": {
+                      "endpoint": {
+                        "minLength": 1,
+                        "pattern": "^(?:https://[^\\s?#/@]+(?:/[^\\s?#]*)?|http://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::\\d+)?(?:/[^\\s?#]*)?)$",
+                        "default": "https://codex.unblocklabs.ai/v1/decisions",
+                        "description": "Decision model endpoint URL (HTTPS, or loopback HTTP for local testing).",
+                        "type": "string"
+                      },
+                      "model": {
+                        "minLength": 1,
+                        "default": "liquid/d1.2-ultra",
+                        "description": "Decision model identifier (e.g. liquid/d1.2-ultra).",
+                        "type": "string"
+                      },
+                      "apiKey": {
+                        "minLength": 1,
+                        "pattern": "^\\S+$",
+                        "description": "Inline bearer token (mutually exclusive with apiKeyFile).",
+                        "type": "string"
+                      },
+                      "apiKeyFile": {
+                        "minLength": 1,
+                        "pattern": "^/",
+                        "description": "Absolute path to a raw token or dotenv file (mutually exclusive with apiKey).",
+                        "type": "string"
+                      },
+                      "timeoutMs": {
+                        "minimum": 1,
+                        "maximum": 60000,
+                        "description": "Per-request timeout in ms; omitted uses settings.decisionTimeoutSeconds (clamped to 60000).",
+                        "type": "integer"
+                      }
+                    }
+                  }
+                ]
               },
               "wakeOnExternalReplies": {
                 "default": false,
@@ -605,8 +653,56 @@
                   ],
                   "properties": {
                     "decisionModel": {
-                      "minLength": 1,
-                      "type": "string"
+                      "anyOf": [
+                        {
+                          "minLength": 1,
+                          "description": "OpenClaw Decisions runtime provider/model string (legacy, e.g. typesafe/jev-1.13.0).",
+                          "type": "string"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "not": {
+                            "required": [
+                              "apiKey",
+                              "apiKeyFile"
+                            ]
+                          },
+                          "type": "object",
+                          "properties": {
+                            "endpoint": {
+                              "minLength": 1,
+                              "pattern": "^(?:https://[^\\s?#/@]+(?:/[^\\s?#]*)?|http://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::\\d+)?(?:/[^\\s?#]*)?)$",
+                              "default": "https://codex.unblocklabs.ai/v1/decisions",
+                              "description": "Decision model endpoint URL (HTTPS, or loopback HTTP for local testing).",
+                              "type": "string"
+                            },
+                            "model": {
+                              "minLength": 1,
+                              "default": "liquid/d1.2-ultra",
+                              "description": "Decision model identifier (e.g. liquid/d1.2-ultra).",
+                              "type": "string"
+                            },
+                            "apiKey": {
+                              "minLength": 1,
+                              "pattern": "^\\S+$",
+                              "description": "Inline bearer token (mutually exclusive with apiKeyFile).",
+                              "type": "string"
+                            },
+                            "apiKeyFile": {
+                              "minLength": 1,
+                              "pattern": "^/",
+                              "description": "Absolute path to a raw token or dotenv file (mutually exclusive with apiKey).",
+                              "type": "string"
+                            },
+                            "timeoutMs": {
+                              "minimum": 1,
+                              "maximum": 60000,
+                              "description": "Per-request timeout in ms; omitted uses settings.decisionTimeoutSeconds (clamped to 60000).",
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      ]
                     },
                     "wakeOnExternalReplies": {
                       "default": false,

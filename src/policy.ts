@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
+import { DEFAULT_DECISIONS_ENDPOINT, DEFAULT_DECISIONS_MODEL, decisionModelScope, resolveDecisionConfig } from "@unblocklabs/decisions";
 import { parseWakeFrom, type MailConfig } from "./mail.js";
 import type { MailState } from "./state.js";
 
@@ -78,8 +79,18 @@ export const PolicySchema = Type.Object({
     }, object), { description: "Deterministic authenticated non-self sender/address, exact-domain and/or Gmail query match. An explicit action, including skip, settles routing without Jev." })),
   }, object)),
 }, object);
+export const DecisionModelConfigSchema = Type.Object({
+  endpoint: Type.Optional(Type.String({ minLength: 1, pattern: "^(?:https://[^\\s?#/@]+(?:/[^\\s?#]*)?|http://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::\\d+)?(?:/[^\\s?#]*)?)$", default: DEFAULT_DECISIONS_ENDPOINT, description: "Decision model endpoint URL (HTTPS, or loopback HTTP for local testing)." })),
+  model: Type.Optional(Type.String({ minLength: 1, default: DEFAULT_DECISIONS_MODEL, description: "Decision model identifier (e.g. liquid/d1.2-ultra)." })),
+  apiKey: Type.Optional(Type.String({ minLength: 1, pattern: "^\\S+$", description: "Inline bearer token (mutually exclusive with apiKeyFile)." })),
+  apiKeyFile: Type.Optional(Type.String({ minLength: 1, pattern: "^/", description: "Absolute path to a raw token or dotenv file (mutually exclusive with apiKey)." })),
+  timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 60_000, description: "Per-request timeout in ms; omitted uses settings.decisionTimeoutSeconds (clamped to 60000)." })),
+}, { ...object, not: { required: ["apiKey", "apiKeyFile"] } });
 export const TriageInputSchema = Type.Object({
-  decisionModel: Type.String({ minLength: 1 }),
+  decisionModel: Type.Union([
+    Type.String({ minLength: 1, description: "OpenClaw Decisions runtime provider/model string (legacy, e.g. typesafe/jev-1.13.0)." }),
+    DecisionModelConfigSchema,
+  ]),
   wakeOnExternalReplies: Type.Optional(Type.Boolean({ default: false, deprecated: true, description: "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt." })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, default: 50 })),
   policy: Type.Optional(PolicySchema),
@@ -87,8 +98,24 @@ export const TriageInputSchema = Type.Object({
 export type Policy = Static<typeof PolicySchema>;
 export type PolicyLabel = Policy["labels"][number];
 export type RuntimeLabel = PolicyLabel & { since?: number };
-export type TriageConfig = Static<typeof TriageInputSchema> & { concurrency: number };
+export interface DirectDecisionModelConfig {
+  endpoint: string;
+  model: string;
+  apiKey?: string;
+  apiKeyFile?: string;
+  timeoutMs?: number;
+}
+export type TriageConfig = Omit<Static<typeof TriageInputSchema>, "decisionModel" | "concurrency"> & {
+  decisionModel: string | DirectDecisionModelConfig;
+  concurrency: number;
+};
 export type Action = "wake" | "queue" | "skip" | "delete";
+
+export function triageModelId(triage?: Pick<TriageConfig, "decisionModel">): string | null {
+  if (!triage) return null;
+  if (typeof triage.decisionModel === "string") return triage.decisionModel;
+  return decisionModelScope(triage.decisionModel.model, triage.decisionModel.endpoint);
+}
 
 const routingLabels: Policy["labels"] = [
   { name: "Needs attention now", action: "wake", description: "A concrete, current, unresolved request directed to this account by an authenticated approved human sender, or owned work that cannot wait until the next queue (a current outage, explicit urgent request or confirmed security incident). Includes an unanswered request to reply, acknowledge, confirm receipt, provide information or do work. Approval alone is not enough: informational or already-completed requests do not match." },
@@ -149,8 +176,19 @@ export function parsePolicy(value: unknown): Policy {
 export function parseTriage(value: unknown): TriageConfig | undefined {
   if (value === undefined) return;
   if (!Value.Check(TriageInputSchema, value)) throw new Error("invalid triage configuration: use decisionModel, concurrency and policy {prompt, deletePrompt, queueMinutes, labels}; legacy rule/review settings must be migrated explicitly");
-  if (!value.decisionModel.includes("/")) throw new Error("decisionModel must be provider/model");
-  return { ...value, concurrency: value.concurrency ?? 50 };
+  if (typeof value.decisionModel === "string") {
+    if (!value.decisionModel.includes("/")) throw new Error("decisionModel must be provider/model");
+    return { ...value, decisionModel: value.decisionModel, concurrency: value.concurrency ?? 50 };
+  }
+  const resolved = resolveDecisionConfig(value.decisionModel);
+  const decisionModel: DirectDecisionModelConfig = {
+    endpoint: resolved.endpoint,
+    model: resolved.model,
+    ...(resolved.apiKey !== undefined ? { apiKey: resolved.apiKey } : {}),
+    ...(resolved.apiKeyFile !== undefined ? { apiKeyFile: resolved.apiKeyFile } : {}),
+    ...(value.decisionModel.timeoutMs !== undefined ? { timeoutMs: resolved.timeoutMs } : {}),
+  };
+  return { ...value, decisionModel, concurrency: value.concurrency ?? 50 };
 }
 
 /** One versioned store for policy and live runtime settings, including responder-only installs. */

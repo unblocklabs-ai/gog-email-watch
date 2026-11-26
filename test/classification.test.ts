@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { Ajv } from "ajv";
 import type { DecisionBatch, DecisionRuntimeV1 } from "openclaw/plugin-sdk/decisions";
 import { parseConfig, type GmailMessage, type GmailThread } from "../src/mail.js";
-import { createPolicyStore, defaultPolicy, hash, parsePolicy, type Policy } from "../src/policy.js";
+import { createPolicyStore, defaultPolicy, hash, parsePolicy, triageModelId, type Policy } from "../src/policy.js";
 import { MailState } from "../src/state.js";
 import { createTriage } from "../src/triage.js";
+import { createMailWorkflow } from "../src/workflow.js";
 
 function message(id = "aa01", sender = "bek@example.com", authenticated = true): GmailMessage {
   return { id, threadId: "bb01", internalDate: String(Date.now()), labelIds: ["INBOX"], payload: {
@@ -198,4 +202,85 @@ test("legacy policy upgrade keeps custom prompt, labels, history and completed o
   assert.equal(state.message("needs_review")?.status, "needs_review");
   assert.equal(state.message("skipped")?.status, "pending");
   assert.throws(() => parsePolicy({ ...mappedPolicy, deletePrompt: "", labels: [{ name: "Delete", description: "Ads", action: "delete" }] }), /explicit deletion/);
+});
+
+test("direct @unblocklabs/decisions config validates, calls /v1/decisions, caches results, and hides credentials from status", async t => {
+  const canonical = parseConfig({ account: "agent@example.com", triage: { decisionModel: {} } });
+  assert.equal(triageModelId(canonical.triage), "liquid/d1.2-ultra");
+  assert.deepEqual(canonical.triage?.decisionModel, {
+    endpoint: "https://codex.unblocklabs.ai/v1/decisions",
+    model: "liquid/d1.2-ultra",
+  });
+  assert.throws(() => parseConfig({ account: "agent@example.com", triage: { decisionModel: { endpoint: "http://example.com/v1/decisions" } } }), /invalid triage/);
+  assert.throws(() => parseConfig({ account: "agent@example.com", triage: { decisionModel: { apiKey: "k1", apiKeyFile: "/tmp/key.env" } } }), /not both/);
+  assert.throws(() => parseConfig({ account: "agent@example.com", triage: { decisionModel: { apiKeyFile: "relative.env" } } }), /invalid triage/);
+  // OpenClaw Gateway validates openclaw.plugin.json with Ajv; ensure invalid direct-model configs fail there too.
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8")) as { configSchema: object };
+  const validateManifest = new Ajv({ strict: false }).compile(manifest.configSchema);
+  assert.equal(validateManifest({ account: "agent@example.com", triage: { decisionModel: {} } }), true);
+  assert.equal(validateManifest({ account: "agent@example.com", triage: { decisionModel: { apiKey: "k1", apiKeyFile: "/tmp/key.env" } } }), false);
+  assert.equal(validateManifest({ account: "agent@example.com", triage: { decisionModel: { endpoint: "http://example.com/v1/decisions" } } }), false);
+  assert.equal(validateManifest({ account: "agent@example.com", triage: { decisionModel: { apiKeyFile: "relative.env" } } }), false);
+
+  const dir = mkdtempSync(join(tmpdir(), "gog-decisions-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const keyFile = join(dir, "decisions.env");
+  writeFileSync(keyFile, "CODEX_LB_API_KEY=test-secret-token\n", { mode: 0o600 });
+
+  const requests: Array<{ auth?: string; body: { model: string; state: unknown; questions: Record<string, { type: string }> } }> = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model: string; state: unknown; questions: Record<string, { type: string }> };
+      requests.push({ auth: req.headers.authorization, body });
+      const answers = Object.fromEntries(Object.keys(body.questions).map(id => {
+        const apply = id === "label_0";
+        return [id, { type: "choice", choice: apply ? "apply" : "skip", confidence: 0.99, probabilities: { apply: apply ? 0.99 : 0.01, skip: apply ? 0.01 : 0.99 } }];
+      }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ model: "liquid/d1.2-ultra-20261116", answers, usage: { input_tokens: 100, output_tokens: 10 } }));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/decisions`;
+
+  const config = parseConfig({
+    account: "agent@example.com",
+    triage: { decisionModel: { endpoint, model: "liquid/d1.2-ultra", apiKeyFile: keyFile }, policy: mappedPolicy },
+  });
+  const state = stateFor(t);
+  const policies = createPolicyStore(config, state);
+  const thread: GmailThread = { id: "bb01", messages: [message()] };
+  const triage = createTriage({
+    config, state, policies, signal: new AbortController().signal, mutate: work => work(),
+    mail: { async getThread() { return thread; }, async labelId(name) { return `label:${name}`; }, async modify(ids) { return { updated: ids }; } },
+  });
+
+  const first = await triage.assess(thread, thread.messages);
+  assert.equal(first.action, "wake");
+  assert.deepEqual(first.labels, ["Urgent"]);
+  assert.equal(first.source, "decision_model");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].auth, "Bearer test-secret-token");
+  assert.equal(requests[0].body.model, "liquid/d1.2-ultra");
+  assert.ok(Array.isArray(requests[0].body.state), "decisions dialect wraps object state in a single-element array");
+
+  // Repeat assessment reuses SQLite cache without a second HTTP request
+  const second = await triage.assess(thread, thread.messages);
+  assert.equal(second.action, "wake");
+  assert.equal(requests.length, 1);
+
+  // workflow.status().triage.model reports scope string and never exposes apiKey/apiKeyFile
+  const wfDir = mkdtempSync(join(tmpdir(), "gog-decisions-wf-"));
+  t.after(() => rmSync(wfDir, { recursive: true, force: true }));
+  const wf = createMailWorkflow({
+    config, stateDir: wfDir,
+    subagent: { async run() { return { runId: "r1", sessionKey: "s1" }; }, async waitForRun() { return { status: "ok" }; } },
+  });
+  t.after(() => wf.stop());
+  const statusJson = JSON.stringify(wf.status());
+  assert.equal(wf.status().triage.model, `liquid/d1.2-ultra@${endpoint}`);
+  assert.ok(!statusJson.includes("test-secret-token") && !statusJson.includes(keyFile));
 });
