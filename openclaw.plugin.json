@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Label-first Gmail triage, configurable mailbox routing and optional approved-sender responses.",
   "activation": {
     "onStartup": true
