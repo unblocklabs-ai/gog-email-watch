@@ -14,6 +14,7 @@ export const SettingsSchema = Type.Partial(Type.Object({
   replyAllowed: Type.Boolean({ default: true, description: "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends." }),
   triageReplyAllowed: Type.Union([Type.Boolean(), Type.Null()], { default: null, description: "Triage reply permission; null inherits replyAllowed. Global replyAllowed=false always disables sends." }),
   replyRecipients: Type.Union([Type.Array(Type.String()), Type.Null()], { default: null, description: "Allowed reply recipients as addresses or exact domains; null inherits domains and senders. Waking never grants reply permission." }),
+  applyLabels: Type.Boolean({ default: true, description: "Apply matched policy/rule category labels in Gmail. Set false to keep Gmail label state untouched while still recording classifications locally." }),
   completionLabels: Type.Array(Type.String({ minLength: 1 }), { default: [], description: "Gmail labels applied after confirmed handling, including a deliberate no-action decision; never after failed or uncertain work." }),
   wakePrompt: Type.String({ default: "", description: "Additional instructions for the awakened triage agent, not Jev." }),
   responderPrompt: Type.String({ default: "", description: "Additional instructions for new-mail responder jobs." }),
@@ -43,7 +44,7 @@ export const defaultSettings: StoredSettings = {
   wakeFrom: [],
   wakeScope: "in:inbox", wakeQuery: "", triageQuery: "in:inbox",
   replyAllowed: true,
-  triageReplyAllowed: null, replyRecipients: null, completionLabels: [],
+  triageReplyAllowed: null, replyRecipients: null, applyLabels: true, completionLabels: [],
   agentConcurrency: 1,
   wakePrompt: "", responderPrompt: "", pollIntervalSeconds: 120, concurrency: 50, labelConcurrency: null,
   retryDelaySeconds: null, decisionTimeoutSeconds: 30, gogTimeoutSeconds: 90, agentWaitTimeoutSeconds: 660,
@@ -237,8 +238,13 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
       state.db.prepare("UPDATE jobs SET status='cancelled',finished=? WHERE thread_id='triage' AND status='queued'").run(now());
       if (!previous) state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE status='queued' AND job_id IS NULL AND id IN (SELECT id FROM triage)").run();
     }
-    if (!previous || hash(previous.document.labels) !== hash(next.document.labels))
+    if (!next.settings.applyLabels)
+      state.db.prepare("UPDATE label_work SET status='cancelled',reason='label writes disabled by settings.applyLabels' WHERE status='pending'").run();
+    else if (!previous || !previous.settings.applyLabels || hash(previous.document.labels) !== hash(next.document.labels)) {
+      if (previous && !previous.settings.applyLabels)
+        state.db.prepare("INSERT OR IGNORE INTO label_work(id,thread_id,status) SELECT id,thread_id,'pending' FROM messages WHERE status IN ('pending','wake','queue','skipped') AND job_id IS NULL AND id IN (SELECT id FROM triage)").run();
       state.db.prepare("UPDATE label_work SET status='pending',due=0 WHERE id IN (SELECT id FROM messages WHERE status IN ('pending','wake','queue','skipped') AND job_id IS NULL)").run();
+    }
   }
   function save(snapshot: Snapshot, actor: string) {
     // Compatibility selectors retain their historical activation timestamps,
@@ -280,19 +286,24 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const threadMigration = config.triage && state.meta("triage_unit") !== "rolling-thread";
   const classificationMigration = config.triage && state.meta("triage_classification") !== "label-first-v1";
   // Recognize the old file fingerprint without resetting persisted live overrides.
+  const { applyLabels: _applyLabels, ...v040Settings } = configuredSettings;
   const { replyAllowed: _reply, agentConcurrency: _agents, wakeFrom: _wakeFrom,
     wakeScope: _wakeScope, wakeQuery: _wakeQuery, triageQuery: _triageQuery,
     triageReplyAllowed: _triageReply, replyRecipients: _recipients, completionLabels: _completion, ...v036Settings } = {
-    ...configuredSettings, reconcileLookbackSeconds: config.settings?.reconcileLookbackSeconds === undefined ? 7 * 86400 : config.settings.reconcileLookbackSeconds,
+    ...v040Settings, reconcileLookbackSeconds: config.settings?.reconcileLookbackSeconds === undefined ? 7 * 86400 : config.settings.reconcileLookbackSeconds,
   };
   const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = v036Settings;
   const legacySettingsHash = hash({ ...previousSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
   const newOverrides = ["maxAgeDays", "maxInputTokens", "maxRequestTokens"].some(key => key in (config.settings ?? {}));
   const oldFingerprint = state.meta("runtime_config_settings");
-  const unchangedLegacySettings = !["replyAllowed", "agentConcurrency", "wakeFrom", "wakeScope", "wakeQuery", "triageQuery",
-    "triageReplyAllowed", "replyRecipients", "completionLabels"].some(key => key in (config.settings ?? {})) &&
-    (oldFingerprint === hash(v036Settings) || (!newOverrides &&
-      (oldFingerprint === hash(previousSettings) || oldFingerprint === legacySettingsHash)));
+  const unchangedLegacySettings = !("applyLabels" in (config.settings ?? {})) && (
+    oldFingerprint === hash(v040Settings) || (
+      !["replyAllowed", "agentConcurrency", "wakeFrom", "wakeScope", "wakeQuery", "triageQuery",
+        "triageReplyAllowed", "replyRecipients", "completionLabels"].some(key => key in (config.settings ?? {})) &&
+      (oldFingerprint === hash(v036Settings) || (!newOverrides &&
+        (oldFingerprint === hash(previousSettings) || oldFingerprint === legacySettingsHash)))
+    )
+  );
   const settingsChanged = oldFingerprint !== settingsHash && !unchangedLegacySettings;
   // Old snapshots materialized the seven-day default. Upgrade implicit defaults,
   // but retain numeric file choices and any detectable live lookback edits.

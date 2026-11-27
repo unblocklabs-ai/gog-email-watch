@@ -356,3 +356,109 @@ test("reply overrides apply to rule and Jev wakes, while recipient allowlists ne
     assert.equal(provider.calls(), 2, "direct wake replies do not require classification");
   } finally { await workflow.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("gog_email_reply recipients narrows approved audience and fails closed on unapproved or empty lists", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gog-email-selection-test-"));
+  const messages: GmailMessage[] = [];
+  const source = mailbox(messages);
+  const config = parseConfig({ account, domains: ["example.com"], senders: ["bek@partner.test"] });
+  let workflow: Workflow;
+  const subagent: MailSubagent = { async run({ idempotencyKey, sessionKey }) {
+    const id = jobId(idempotencyKey);
+    const context = workflow.context(id, sessionKey);
+    const target = context.messages[0];
+    const base = { jobId: id, sessionKey, body: "Private reply." };
+    if (target.threadId === "bb01") {
+      await assert.rejects(workflow.reply({ ...base, recipients: [] }), /cannot be empty/);
+      await assert.rejects(workflow.reply({ ...base, recipients: ["intruder@outside.test"] }), /not in the approved reply audience/);
+      await assert.rejects(workflow.reply({ ...base, recipients: ["not-an-email"] }), /invalid reply recipient/);
+      await assert.rejects(workflow.reply({ ...base, recipients: ["amanda@example.com"], externalTo: ["team@example.com"] }), /cannot re-add/);
+      // Narrow to sender only (drops team@example.com and cc bek@partner.test)
+      await workflow.reply({ ...base, recipients: ["Amanda <amanda@example.com>"] });
+    } else if (target.threadId === "bb02") {
+      // Narrow exclusively to a CC participant -> promoted to To
+      await workflow.reply({ ...base, recipients: ["bek@partner.test"] });
+    }
+    return { runId: id, sessionKey };
+  }, async waitForRun() { return { status: "ok" }; } };
+  workflow = createMailWorkflow({ config, stateDir: dir, mail: source.mail, subagent });
+  try {
+    await workflow.cycle();
+    messages.push(
+      message(1, { sender: "amanda@example.com", received: Date.now() + 100, to: `${account}, team@example.com`, cc: "bek@partner.test" }),
+      message(2, { sender: "amanda@example.com", received: Date.now() + 200, to: `${account}, team@example.com`, cc: "bek@partner.test" }),
+    );
+    await workflow.cycle();
+    assert.equal(source.sent.length, 2);
+    assert.deepEqual(source.sent[0], { targetMessageId: "aa01", to: ["amanda@example.com"], cc: [], body: "Private reply." });
+    assert.deepEqual(source.sent[1], { targetMessageId: "aa02", to: ["bek@partner.test"], cc: [], body: "Private reply." });
+  } finally { await workflow.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("applyLabels false prevents Gmail label creation and modification while preserving local classification and wakes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gog-email-selection-test-"));
+  const messages: GmailMessage[] = [];
+  const source = mailbox(messages);
+  let labelIdCalls = 0;
+  let modifyCalls = 0;
+  const origLabelId = source.mail.labelId;
+  const origModify = source.mail.modify;
+  source.mail.labelId = async name => { labelIdCalls++; return origLabelId(name); };
+  source.mail.modify = async (ids, add, remove) => { modifyCalls++; return origModify(ids, add, remove); };
+  const provider = classifier(() => "Action");
+  const config = parseConfig({ account, triage: { decisionModel: model, policy: { ...defaultPolicy,
+    labels: [{ name: "Action", description: "Needs action", action: "wake" }] } },
+    settings: { wakeFrom: ["vip@example.com"], applyLabels: false, replyAllowed: false } });
+  let workflow: Workflow;
+  const covered: string[][] = [];
+  const subagent: MailSubagent = { async run({ idempotencyKey, sessionKey }) {
+    const id = jobId(idempotencyKey);
+    covered.push(workflow.context(id, sessionKey).messages.flatMap(m => m.messageIds));
+    workflow.complete({ jobId: id, sessionKey, reason: "Reviewed read-only" });
+    return { runId: id, sessionKey };
+  }, async waitForRun() { return { status: "ok" }; } };
+  workflow = createMailWorkflow({ config, stateDir: dir, mail: source.mail, subagent, ...provider });
+  try {
+    await workflow.cycle();
+    messages.push(
+      message(1, { sender: "vip@example.com", received: Date.now() + 100 }),
+      message(2, { sender: "other@outside.test", received: Date.now() + 200 }),
+    );
+    await workflow.cycle();
+    assert.deepEqual(covered.flat().sort(), ["aa01", "aa02"]);
+    assert.equal(labelIdCalls, 0, "applyLabels=false must not create or look up category labels in Gmail");
+    assert.equal(modifyCalls, 0, "applyLabels=false must not modify Gmail labels");
+    const plan1 = workflow.inspect("aa01")[0].plan as { labels?: string[] } | undefined;
+    assert.deepEqual(plan1?.labels, ["Wake from vip@example.com"], "matched labels remain persisted locally");
+    assert.equal(workflow.inspect("aa01")[0].labels, undefined);
+  } finally { await workflow.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("deterministic rule wakes reuse per-cycle rule memberships instead of repeating full Gmail searches", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gog-email-selection-test-"));
+  const messages: GmailMessage[] = [];
+  const source = mailbox(messages);
+  let ruleSearchCalls = 0;
+  const origSearch = source.mail.searchPage;
+  source.mail.searchPage = async (after, page, scope, before, query) => {
+    if (query?.includes("from:vip@example.com") || query?.includes("from:ops@example.com")) ruleSearchCalls++;
+    return origSearch(after, page, scope, before, query);
+  };
+  const config = parseConfig({ account, settings: { wakeFrom: ["vip@example.com", "ops@example.com"], wakeScope: "in:inbox", replyAllowed: false } });
+  let workflow: Workflow;
+  const subagent: MailSubagent = { async run({ idempotencyKey, sessionKey }) {
+    const id = jobId(idempotencyKey);
+    workflow.complete({ jobId: id, sessionKey, reason: "Handled" });
+    return { runId: id, sessionKey };
+  }, async waitForRun() { return { status: "ok" }; } };
+  workflow = createMailWorkflow({ config, stateDir: dir, mail: source.mail, subagent });
+  try {
+    await workflow.cycle();
+    ruleSearchCalls = 0;
+    messages.push(message(1, { sender: "vip@example.com", received: Date.now() + 100 }));
+    await workflow.cycle();
+    assert.equal(workflow.inspect("aa01")[0].message.status, "done");
+    // 2 rules x (discoverRules + dispatchWake refresh) = 4 max (previously 12-14!)
+    assert.ok(ruleSearchCalls <= 4, `expected <= 4 rule searchPage calls across full wake+label cycle, got ${ruleSearchCalls}`);
+  } finally { await workflow.stop(); rmSync(dir, { recursive: true, force: true }); }
+});

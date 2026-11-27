@@ -370,6 +370,11 @@
                   }
                 ]
               },
+              "applyLabels": {
+                "default": true,
+                "description": "Apply matched policy/rule category labels in Gmail. Set false to keep Gmail label state untouched while still recording classifications locally.",
+                "type": "boolean"
+              },
               "completionLabels": {
                 "default": [],
                 "description": "Gmail labels applied after confirmed handling, including a deliberate no-action decision; never after failed or uncertain work.",
@@ -872,6 +877,11 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "applyLabels": {
+                      "default": true,
+                      "description": "Apply matched policy/rule category labels in Gmail. Set false to keep Gmail label state untouched while still recording classifications locally.",
+                      "type": "boolean"
                     },
                     "completionLabels": {
                       "default": [],

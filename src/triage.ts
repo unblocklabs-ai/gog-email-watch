@@ -28,7 +28,7 @@ export function createTriage(options: {
   config: MailConfig; state: MailState; mail: TriageMail; signal: AbortSignal;
   policies: PolicyStore;
   mutate: <T>(work: () => Promise<T>) => Promise<T>;
-  selected?: (id: string) => Promise<boolean>;
+  selected?: (id: string, options?: { fresh?: boolean; thread?: GmailThread }) => Promise<boolean>;
   matchesRule?: (id: string, label: RuntimeLabel) => Promise<boolean>;
   decisions?: DecisionRuntimeV1; decisionModel?: () => string | undefined;
 }) {
@@ -193,15 +193,16 @@ export function createTriage(options: {
       if (!target || evidence(thread).hash !== row.evidence_hash) throw new Error("mail changed before effect; retry");
       if (kind === "labels" && Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)) return;
       if (kind === "labels" && (target.labelIds.some(label => ["SPAM", "SENT", "DRAFT", "TRASH"].includes(label)) ||
-        !(options.selected ? await options.selected(row.id) : target.labelIds.includes("INBOX")))) return;
+        !(options.selected ? await options.selected(row.id, { fresh: false, thread }) : target.labelIds.includes("INBOX")))) return;
       if (!remove.length && target.labelIds.includes("TRASH")) return;
       const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
       // Reconcile already-applied writes, but do not delete mail that left this scope.
       if (kind !== "labels" && !applied && (target.labelIds.some(label => ["SPAM", "SENT", "DRAFT", "TRASH"].includes(label)) ||
-        (kind === "backlog" && (!(options.selected ? await options.selected(row.id) : target.labelIds.includes("INBOX")) || Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)))))
+        (kind === "backlog" && (!(options.selected ? await options.selected(row.id, { fresh: true, thread }) : target.labelIds.includes("INBOX")) || Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)))))
         throw new Error("mail left deletion scope before effect; retry");
       assertCurrent(row.policy_version);
       assertAdmission();
+      if (kind === "labels" && !policies.settings().applyLabels) return;
       state.db.prepare("INSERT OR REPLACE INTO effects(id,message_id,status,intent,updated) VALUES (?,?,'pending',?,?)")
         .run(key, row.id, JSON.stringify({ add, remove }), now());
       try {

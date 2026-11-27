@@ -14,6 +14,7 @@ import {
   mailCutoff,
   explicitExternalRecipients,
   isGmailId,
+  narrowReplyRecipients,
   renderThread,
   replyRecipients,
   senderAddress,
@@ -54,6 +55,7 @@ export interface ReplyInput {
   externalScheduling?: boolean;
   replyTargetMessageId?: string;
   externalTo?: string[];
+  recipients?: string[];
 }
 
 export interface SkipInput {
@@ -103,6 +105,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
   let labeling = false;
   let completing = false;
   const ruleMembers = new Map<string, Set<string>>();
+  const inFlightSelections = new Map<string, Promise<Map<string, string>>>();
   let stopped = false;
   let closed = false;
   const savedScan = state.meta("last_scan");
@@ -203,11 +206,22 @@ export function createMailWorkflow(options: WorkflowOptions) {
     } while (page);
   }
 
-  async function selectedMessages(query: string, after = Math.floor(mailCutoff(policies.settings().maxAgeDays) / 1000)) {
-    const selected = new Map<string, string>();
-    for await (const messages of searchPages(after, "all", undefined, query))
-      for (const item of messages) selected.set(item.id, item.threadId);
-    return selected;
+  async function selectedMessages(query: string, after = Math.floor(mailCutoff(policies.settings().maxAgeDays) / 1000), shared = true) {
+    const key = `${after}\0${query}`;
+    if (shared) {
+      const existing = inFlightSelections.get(key);
+      if (existing) return existing;
+    }
+    const pending = (async () => {
+      const selected = new Map<string, string>();
+      for await (const messages of searchPages(after, "all", undefined, query))
+        for (const item of messages) selected.set(item.id, item.threadId);
+      return selected;
+    })();
+    if (!shared) return pending;
+    const tracked = pending.finally(() => { inFlightSelections.delete(key); });
+    inFlightSelections.set(key, tracked);
+    return tracked;
   }
 
   function ruleQuery(label: RuntimeLabel) {
@@ -223,7 +237,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
       if (part.match?.senders?.length && !part.match.senders.includes(row.sender) ||
         part.match?.domains?.length && !part.match.domains.includes(row.sender.split("@")[1])) continue;
       const key = ruleKey(part);
-      const members = fresh ? new Set((await selectedMessages(ruleQuery(part))).keys()) : ruleMembers.get(key);
+      const members = fresh || !ruleMembers.has(key) ? new Set((await selectedMessages(ruleQuery(part), undefined, !fresh)).keys()) : ruleMembers.get(key);
       if (!members?.has(id)) continue;
       if (!part.match?.newOnly) return true;
       const since = Number(state.meta(`label_since:${key}`) ?? part.since ?? Date.now());
@@ -232,18 +246,20 @@ export function createMailWorkflow(options: WorkflowOptions) {
     }
     return false;
   }
-  async function matchesSelection(id: string): Promise<boolean> {
+  async function matchesSelection(id: string, options?: { fresh?: boolean; thread?: GmailThread }): Promise<boolean> {
+    const fresh = options?.fresh ?? true;
     const query = policies.settings().triageQuery;
     // The default predicate is directly observable in the fresh thread, without
     // another page walk. Arbitrary Gmail syntax remains Gmail's responsibility.
     if (query.trim() === "in:inbox") {
       const row = state.message(id);
       if (!row) return false;
-      const target = (await mail.getThread(row.thread_id)).messages.find(message => message.id === id);
+      const thread = options?.thread?.id === row.thread_id ? options.thread : await mail.getThread(row.thread_id);
+      const target = thread.messages.find(message => message.id === id);
       if (config.triage && target?.labelIds.includes("INBOX")) return true;
-    } else if (config.triage && (await selectedMessages(query)).has(id)) return true;
+    } else if (config.triage && (await selectedMessages(query, undefined, !fresh)).has(id)) return true;
     for (const label of policies.get().labels) {
-      if (label.match && await matchesRule(id, label, true)) return true;
+      if (label.match && await matchesRule(id, label, fresh)) return true;
     }
     return false;
   }
@@ -420,7 +436,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
     for (const row of rows) {
       const message = thread.messages.find(message => message.id === row.id);
       const unfinishedDelete = !!state.db.prepare("SELECT 1 FROM effects WHERE message_id=? AND status!='confirmed' AND instr(intent,'TRASH')>0").get(row.id);
-      const selected = message && await matchesSelection(row.id);
+      const selected = message && await matchesSelection(row.id, { fresh: false, thread });
       if (!message || (!selected && !unfinishedDelete) || message.labelIds.some(label => ["SPAM", "SENT", "DRAFT"].includes(label)) ||
         (message.labelIds.includes("TRASH") && !unfinishedDelete)) {
         if (!rulesOnly || config.triage) results.set(row.id, { status: "ignored", reason: "no longer in the triage selection" });
@@ -445,7 +461,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
       }
       for (const row of result.rows) {
         try {
-          if (result.action !== "delete" && !(await matchesSelection(row.id))) {
+          if (result.action !== "delete" && !(await matchesSelection(row.id, result.source === "rules" ? { fresh: false, thread } : { fresh: true }))) {
             results.set(row.id, { status: "ignored", reason: "no longer in the triage selection" });
             continue;
           }
@@ -454,7 +470,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
             continue;
           }
           if (result.action === "delete") await service.deleteMail(row);
-          else service.scheduleLabels(row.id, row.thread_id);
+          else if (policies.settings().applyLabels) service.scheduleLabels(row.id, row.thread_id);
           if (result.action === "skip" && !unfinishedDeletion(row.id)) acknowledge([row.id]);
           results.set(row.id, { status: result.action === "delete" ? "done" : result.action === "skip" ? "skipped" : result.action === "wake" ? "wake" : "queue", reason: result.action });
         } catch (error) { results.set(row.id, { status: "pending", reason: safeError(error) }); }
@@ -514,7 +530,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
   }
 
   async function processLabels() {
-    if (labeling || stopped) return;
+    if (labeling || stopped || !policies.settings().applyLabels) return;
     labeling = true;
     try {
       const settings = policies.settings();
@@ -590,7 +606,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
 Use gog_email_reply for email delivery, with this job ID and an email-ready plain-text body. In a multi-conversation wake, pass the threadId from gog_email_context. It replies to the conversation's latest covered message. The helper checks the configured approved senders/domains and current Gmail evidence before sending. Classification alone does not approve a sender.
 Read each full conversation before responding; do not repeat completed work. A successful triage reply completes only that conversation. Handle the remaining conversations, then call gog_email_complete; gog_email_defer defers only unfinished conversations.
 For scheduling with visible external participants, set externalScheduling. To address guests on an earlier message in that conversation, also pass its replyTargetMessageId. Use externalTo only for exact external addresses explicitly requested by an authenticated approved sender.
-Normal recipients are approved From/To/Cc addresses, excluding self and duplicates. Reply-To and Bcc are not delivery destinations. The helper appends the configured signature; do not add a manual sign-off. Do not bypass disabled replies or recipient checks through other delivery tools. Final chat output is not email; claim delivery only after the helper succeeds.`;
+Normal recipients are approved From/To/Cc addresses, excluding self and duplicates. Pass recipients to narrow delivery to a subset of those approved participants (for example, a direct sender-only reply on a private thread); recipients can only narrow and never add unapproved addresses. Reply-To and Bcc are not delivery destinations. The helper appends the configured signature; do not add a manual sign-off. Do not bypass disabled replies or recipient checks through other delivery tools. Final chat output is not email; claim delivery only after the helper succeeds.`;
   }
 
   function buildPrompt(job: StoredJob, transcript: string): string {
@@ -1048,8 +1064,12 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_reply", "gog_email_con
       if (!selected) throw new Error("alternate reply target is not in the authorized Gmail thread");
       const sender = senderAddress(selected);
       if (!sender) throw new Error("selected reply message has no valid sender");
-      const { to, cc } = replyRecipients(selected, config, input.externalScheduling, policies.settings().replyRecipients);
-      to.push(...explicitExternalRecipients(input.externalTo ?? [], [...to, ...cc, config.account, ...config.selfAddresses]));
+      const computed = replyRecipients(selected, config, input.externalScheduling, policies.settings().replyRecipients);
+      const { to, cc } = input.recipients !== undefined ? narrowReplyRecipients(computed, input.recipients) : computed;
+      const excluded = input.recipients !== undefined ? [...computed.to, ...computed.cc].filter(r => !to.includes(r) && !cc.includes(r)) : [];
+      const added = explicitExternalRecipients(input.externalTo ?? [], [...to, ...cc, config.account, ...config.selfAddresses]);
+      if (added.some(r => excluded.includes(r))) throw new Error("externalTo cannot re-add recipients excluded by recipients");
+      to.push(...added);
       // Commit the attempt before the external send; any uncertain outcome stays non-replayable.
       state.transaction(() => {
         activeJob(job.id, input.sessionKey);

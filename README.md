@@ -548,6 +548,7 @@ host/provider/platform constraints.
 | `wakeScope` | Deprecated Gmail query; `"in:inbox"` | Compatibility query scope for wake aliases. Prefer `policy.labels[].match.query`. |
 | `wakeQuery` | Deprecated Gmail query; `""` | Compatibility alias for a new-only query-matched wake label. Prefer `match.query` and `match.newOnly`. |
 | `triageQuery` | Gmail query; `"in:inbox"` | Ordinary classification selection. Empty includes archived mail. |
+| `applyLabels` | Boolean; `true` | Apply matched policy/rule category labels in Gmail. Set `false` to keep Gmail label state untouched while still recording classifications locally. |
 | `completionLabels` | Label-name array; `[]` | Apply after confirmed handling, including deliberate skips; retries do not replay inference or agents. |
 | `wakePrompt` | String; `""` | Trusted snippet appended to the awakened triage agent's instructions, not sent to Jev. |
 | `responderPrompt` | String; `""` | Trusted snippet appended to new-mail responder instructions. |
@@ -627,7 +628,7 @@ prompts remain custom: explicitly update `policy.prompt` to adopt the new defaul
 | `gog_email_complete` | `jobId`, `reason` | Finish after handling all conversations, with or without replies. Delivery receipts are recorded separately by the reply tool. |
 | `gog_email_skip` | `jobId`, `reason` | Finish an active job when no action is needed. |
 | `gog_email_defer` | `jobId`, `reason`, `until` | Resume unfinished conversations at a future Unix timestamp in seconds, after fresh checks. Replied conversations stay done. Explicit deferral bypasses the ordinary queue interval when due; polling and active work can still delay dispatch. |
-| `gog_email_reply` | `jobId`, plaintext `body`; `threadId` for multi-conversation wakes; optional `externalScheduling`, `replyTargetMessageId`, `externalTo` | Reply in a covered conversation's original thread when `replyAllowed` is true. The account's gog signature is appended. Existing sender/recipient checks apply. |
+| `gog_email_reply` | `jobId`, plaintext `body`; `threadId` for multi-conversation wakes; optional `recipients`, `externalScheduling`, `replyTargetMessageId`, `externalTo` | Reply in a covered conversation's original thread when `replyAllowed` is true. Pass `recipients` to narrow delivery to a subset of the approved `From`/`To`/`Cc` participants (never expands recipients). The account's gog signature is appended. Existing sender/recipient checks apply. |
 | `gog_email_resolve` | `jobId`, `note`; optional `disposition` | Reconcile an interrupted/failed execution. Default `complete` closes it; `retry` requeues only unfinished work for the next poll. Confirmed replies and send receipts are retained. |
 | `gog_email_scan` | `from`, `to` | Apply historical deletions, as described below. |
 | `gog_email_policy_preview` | Optional candidate `policy`, `settings`, `query` | Real reads/inference in an isolated state snapshot; projected labels, routing, Trash and wakes only. No agent runs or production changes. |

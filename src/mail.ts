@@ -312,6 +312,23 @@ export function explicitExternalRecipients(values: string[], excluded: string[])
   return recipients;
 }
 
+export function narrowReplyRecipients(computed: ReplyRecipients, requested: readonly string[]): ReplyRecipients {
+  if (!requested.length) throw new Error("recipients cannot be empty");
+  const available = new Set([...computed.to, ...computed.cc]);
+  const wanted = new Set<string>();
+  for (const value of requested) {
+    let recipient: string;
+    try { recipient = address(value); } catch { throw new Error("invalid reply recipient"); }
+    if (!available.has(recipient)) throw new Error("requested recipient is not in the approved reply audience");
+    wanted.add(recipient);
+  }
+  const to = computed.to.filter((recipient) => wanted.has(recipient));
+  const cc = computed.cc.filter((recipient) => wanted.has(recipient));
+  if (!to.length && cc.length) return { to: cc, cc: [] };
+  if (!to.length) throw new Error("no approved reply recipients");
+  return { to, cc };
+}
+
 function decodeEntities(value: string): string {
   const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
   return value.replace(/&(#(?:x[0-9a-f]+|[0-9]+)|[a-z]+);/gi, (entity, code: string) => {

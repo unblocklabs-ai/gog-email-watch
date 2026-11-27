@@ -104,7 +104,7 @@ export default definePluginEntry({
         {
           name: "gog_email_reply",
           label: "Reply to watched email",
-          description: "Reply within an active responder or triage job when settings.replyAllowed is true. Select threadId for multi-conversation wakes; each conversation may be replied to once. Existing approved-sender/recipient checks apply. Use externalScheduling only for scheduling with visible external participants; externalTo only for recipients explicitly requested by an approved sender.",
+          description: "Reply within an active responder or triage job when settings.replyAllowed is true. Select threadId for multi-conversation wakes; each conversation may be replied to once. Existing approved-sender/recipient checks apply. Pass recipients to narrow delivery to a subset of the approved From/To/Cc participants. Use externalScheduling only for scheduling with visible external participants; externalTo only for recipients explicitly requested by an approved sender.",
           parameters: Type.Object({
             ...accountProperty,
             jobId: Type.String(),
@@ -113,8 +113,12 @@ export default definePluginEntry({
             externalScheduling: Type.Optional(Type.Boolean()),
             replyTargetMessageId: Type.Optional(Type.String({ description: "Earlier message in the same thread; scheduling only." })),
             externalTo: Type.Optional(Type.Array(Type.String())),
+            recipients: Type.Optional(Type.Array(Type.String(), { minItems: 1, description: "Optional subset of approved visible From/To/Cc addresses to narrow reply recipients (cannot add unapproved addresses)." })),
           }),
           async execute(_id: string, params: Record<string, unknown>) {
+            if (params.recipients !== undefined && (!Array.isArray(params.recipients) || params.recipients.some(value => typeof value !== "string"))) {
+              throw new Error("recipients must be an array of email addresses");
+            }
             return jsonResult(await activeWorkflow(params).reply({
               jobId: readStringParam(params, "jobId", { required: true }),
               body: readStringParam(params, "body", { required: true }),
@@ -123,6 +127,7 @@ export default definePluginEntry({
               externalScheduling: params.externalScheduling === true,
               replyTargetMessageId: readStringParam(params, "replyTargetMessageId"),
               externalTo: readStringArrayParam(params, "externalTo"),
+              recipients: params.recipients === undefined ? undefined : (readStringArrayParam(params, "recipients") ?? []),
             }));
           },
         },
